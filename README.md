@@ -31,9 +31,6 @@
 ![](assets/results/4.jpg)
 ![](assets/results/5.jpg)
 
-训练过程loss变化如下图所示：
-![](assets/losses.jpg)
-
 ## 时间线
 4.3-4.6 阅读相关论文
 4.7-4.8 阅读相关代码
