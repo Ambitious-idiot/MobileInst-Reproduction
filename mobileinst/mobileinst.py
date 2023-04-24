@@ -13,11 +13,22 @@ def get_shape(tensor):
 
 
 class SemanticEnhancer(nn.Module):
-    def __init__(self):
+    def __init__(self, in_local, in_glob, out_feat):
         super(SemanticEnhancer, self).__init__()
+        self.in_local = in_local
+        self.in_glob = in_glob
+        self.out_feat = out_feat
+
+        self.lateral_l = Conv2d_BN(in_local, out_feat)
+        self.lateral_g = Conv2d_BN(in_glob, out_feat)
+        self.out_layer = Conv2d_BN(out_feat, out_feat)
 
     def forward(self, x_l, x_g):
-        return x_l * x_g + x_g
+        x_l = F.relu_(self.lateral_l(x_l))
+        x_g = F.relu_(self.lateral_g(x_g))
+        features = x_l * x_g + x_g
+        features = F.relu_(self.out_layer(features))
+        return features
 
 
 class Conv2d_BN(nn.Sequential):
@@ -51,39 +62,45 @@ class SEMaskDecoder(nn.Module):
         self.n_local = len(channels) - 1
         self.injections = nn.ModuleList()
         for channel in channels:
-            self.injections.append(nn.Sequential(Conv2d_BN(channel, dim, norm=norm), activation()))
-        self.se1 = SemanticEnhancer()
+            self.injections.append(nn.Sequential(Conv2d_BN(channel, dim, norm=norm), activation(inplace=True)))
+        self.se1 = SemanticEnhancer(dim, dim, dim)
         self.conv1 = nn.ModuleList()
         for _ in range(self.n_local):
-            self.conv1.append(nn.Sequential(Conv2d_BN(dim, dim, 3, 1, 1, norm=norm), activation()))
+            self.conv1.append(nn.Sequential(Conv2d_BN(dim, dim, 3, 1, 1, norm=norm), activation(inplace=True)))
         self.conv2 = nn.ModuleList()
         for _ in range(self.n_local):
-            self.conv2.append(nn.Sequential(Conv2d_BN(dim, dim, 3, 1, 1, norm=norm), activation()))
-        self.se2 = SemanticEnhancer()
+            self.conv2.append(nn.Sequential(Conv2d_BN(dim, dim, 3, 1, 1, norm=norm), activation(inplace=True)))
+        self.se2 = SemanticEnhancer(dim, dim, dim)
 
     def forward(self, x_l, x_g):
         x_l = [self.injections[i](x_l[i]) for i in range(self.n_local)]
         x_g = self.injections[-1](x_g)
+        x_g = F.interpolate(x_g, size=x_l[-1].shape[-2:], mode='nearest')
         stage1 = [self.se1(x_l[-1], x_g)]
         for i in range(self.n_local-2, -1, -1):
-            stage1.append(stage1[-1]+x_l[i])
+            up_feature = F.interpolate(stage1[-1], size=x_l[i].shape[-2:], mode='nearest')
+            stage1.append(up_feature+x_l[i])
         stage1 = stage1[::-1]
         stage1 = [self.conv1[i](stage1[i]) for i in range(self.n_local)]
         stage2 = [stage1[0]]
         for i in range(1, len(stage1)):
-            stage2.append(stage2[-1]+stage1[i])
+            down_feature = F.interpolate(
+                stage2[-1], size=stage1[i].shape[-2:], mode='nearest')
+            stage2.append(down_feature+stage1[i])
         stage2 = [self.conv2[i](stage2[i]) for i in range(self.n_local)]
         out = self.se2(stage2[-1], x_g)
         for i in range(len(stage2)-1):
+            out = F.interpolate(out, size=stage2[i].shape[-2:], mode='nearest')
             out = out + stage2[i]
         return out
 
 
 class BaseAttention(nn.Module):
-    def __init__(self, dim, key_dim, num_heads, attn_ratio=4,
+    def __init__(self, dim, num_kernels, key_dim, num_heads, attn_ratio=4,
                  activation=nn.ReLU, norm='bn'):
         super(BaseAttention, self).__init__()
         self.dim = dim
+        self.num_kernels = num_kernels
         self.num_heads = num_heads
         self.key_dim = key_dim
         self.nh_kd = key_dim * num_heads
@@ -97,27 +114,27 @@ class BaseAttention(nn.Module):
         self.proj = nn.Sequential(activation(), nn.Linear(self.dh, dim), nn.BatchNorm1d(dim))
 
     def _attention(self, q, k, v, B):
-        # Q: B*NH*C*KD K: B*NH*KD*HW V: B*NH*HW*D Out: B*C*C
+        # Q: B*NH*NK*KD K: B*NH*KD*HW V: B*NH*HW*D Out: B*NK*C
         attn = torch.matmul(q, k)
         attn = attn.softmax(dim=-1)
         x = torch.matmul(attn, v)
-        x = x.permute(0, 1, 3, 2).reshape(B, self.dh, self.dim).permute(0, 2, 1).reshape(-1, self.dh)
-        return self.proj(x).reshape(-1, self.dim, self.dim)
+        x = x.permute(0, 1, 3, 2).reshape(B, self.dh, self.num_kernels).permute(0, 2, 1).reshape(-1, self.dh)
+        return self.proj(x).reshape(-1, self.num_kernels, self.dim)
 
     def attention(self, q, k, v, B):
-        # Q: B*C*C K: B*C*H*W V: B*C*H*W Out: B*C*C
+        # Q: B*NK*C K: B*C*H*W V: B*C*H*W Out: B*NK*C
         Q = q.reshape(-1, self.dim)
-        Q = self.to_q(Q).reshape(B, self.dim, self.num_heads, self.key_dim).permute(0, 2, 1, 3)
+        Q = self.to_q(Q).reshape(B, self.num_kernels, self.num_heads, self.key_dim).permute(0, 2, 1, 3)
         K = self.to_k(k).reshape(B, self.num_heads, self.key_dim, -1)
         V = self.to_v(v).reshape(B, self.num_heads, self.d, -1).permute(0, 1, 3, 2)
         return self._attention(Q, K, V, B) + q
 
 
 class FixedQAttention(BaseAttention):
-    def __init__(self, dim, key_dim, num_heads, attn_ratio=4,
+    def __init__(self, dim, num_kernels, key_dim, num_heads, attn_ratio=4,
                  activation=nn.ReLU, norm='bn'):
-        super(FixedQAttention, self).__init__(dim, key_dim, num_heads, attn_ratio, activation, norm)
-        self.q = nn.Parameter(torch.randn(1, dim, dim))
+        super(FixedQAttention, self).__init__(dim, num_kernels, key_dim, num_heads, attn_ratio, activation, norm)
+        self.q = nn.Parameter(torch.randn(1, num_kernels, dim))
 
     def forward(self, x):
         B, *_ = get_shape(x)
@@ -126,9 +143,9 @@ class FixedQAttention(BaseAttention):
 
 
 class CrossAttention(BaseAttention):
-    def __init__(self, dim, key_dim, num_heads, attn_ratio=4,
+    def __init__(self, dim, num_kernels, key_dim, num_heads, attn_ratio=4,
                  activation=nn.ReLU, norm='bn'):
-        super(CrossAttention, self).__init__(dim, key_dim, num_heads, attn_ratio, activation, norm)
+        super(CrossAttention, self).__init__(dim, num_kernels, key_dim, num_heads, attn_ratio, activation, norm)
 
     def forward(self, x, y):
         B, *_ = get_shape(x)
@@ -136,20 +153,20 @@ class CrossAttention(BaseAttention):
 
 
 class SelfAttention(BaseAttention):
-    def __init__(self, dim, key_dim, num_heads, attn_ratio=4,
+    def __init__(self, dim, num_kernels, key_dim, num_heads, attn_ratio=4,
                  activation=nn.ReLU, norm='bn'):
-        super(SelfAttention, self).__init__(dim, key_dim, num_heads, attn_ratio, activation, norm)
+        super(SelfAttention, self).__init__(dim, num_kernels, key_dim, num_heads, attn_ratio, activation, norm)
         self.to_k = nn.Sequential(nn.Linear(dim, self.nh_kd), nn.BatchNorm1d(self.nh_kd))
         self.to_v = nn.Sequential(nn.Linear(dim, self.dh), nn.BatchNorm1d(self.dh))
 
     def attention(self, q, k, v, B):
-        # Q: B*C*C K: B*C*C V: B*C*C Out: B*C*C
+        # Q: B*N*C K: B*N*C V: B*N*C Out: B*N*C
         Q = q.reshape(-1, self.dim)
-        Q = self.to_q(Q).reshape(B, self.dim, self.num_heads, self.key_dim).permute(0, 2, 1, 3)
+        Q = self.to_q(Q).reshape(B, self.num_kernels, self.num_heads, self.key_dim).permute(0, 2, 1, 3)
         K = k.reshape(-1, self.dim)
-        K = self.to_k(K).reshape(B, self.dim, self.num_heads, self.key_dim).permute(0, 2, 3, 1)
+        K = self.to_k(K).reshape(B, self.num_kernels, self.num_heads, self.key_dim).permute(0, 2, 3, 1)
         V = v.reshape(-1, self.dim)
-        V = self.to_v(V).reshape(B, self.dim, self.num_heads, self.d).permute(0, 2, 1, 3)
+        V = self.to_v(V).reshape(B, self.num_kernels, self.num_heads, self.d).permute(0, 2, 1, 3)
         return self._attention(Q, K, V, B) + q
 
     def forward(self, x):
@@ -163,13 +180,14 @@ class MLP(nn.Module):
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
         self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = act_layer()
+        self.act = act_layer(inplace=True)
         self.fc2 = nn.Linear(hidden_features, out_features)
 
     def forward(self, x):
         x = self.fc1(x)
         x = self.act(x)
         x = self.fc2(x)
+        x = self.act(x)
         return x
 
 
@@ -233,14 +251,14 @@ class PredictionHead(nn.Module):
 
 
 class DualInstanceDecoder(nn.Module):
-    def __init__(self, dim, key_dim, num_heads, n_cls, mlp_ratio=4., attn_ratio=4,
+    def __init__(self, dim, num_kernels, key_dim, num_heads, n_cls, mlp_ratio=4., attn_ratio=4,
                  activation=nn.ReLU, norm='bn'):
         super(DualInstanceDecoder, self).__init__()
         self.pe = PositionEmbeddingSine(dim//2, normalize=True)
-        self.g_d1 = FixedQAttention(dim, key_dim, num_heads, attn_ratio, activation, norm)
-        self.g_d2 = SelfAttention(dim, key_dim, num_heads, attn_ratio, activation, norm)
-        self.l_d1 = CrossAttention(dim, key_dim, num_heads, attn_ratio, activation, norm)
-        self.l_d2 = SelfAttention(dim, key_dim, num_heads, attn_ratio, activation, norm)
+        self.g_d1 = FixedQAttention(dim, num_kernels, key_dim, num_heads, attn_ratio, activation, norm)
+        self.g_d2 = SelfAttention(dim, num_kernels, key_dim, num_heads, attn_ratio, activation, norm)
+        self.l_d1 = CrossAttention(dim, num_kernels, key_dim, num_heads, attn_ratio, activation, norm)
+        self.l_d2 = SelfAttention(dim, num_kernels, key_dim, num_heads, attn_ratio, activation, norm)
         self.mlp = MLP(dim, int(dim*mlp_ratio), act_layer=activation)
         self.head = PredictionHead(dim, n_cls)
 
@@ -257,22 +275,20 @@ class DualInstanceDecoder(nn.Module):
 
 
 class MobileInst(nn.Module):
-    def __init__(self, backbone, channels, dim, key_dim, num_heads, n_cls, mlp_ratio=4., attn_ratio=4,
+    def __init__(self, channels, dim, num_kernels, key_dim, num_heads,
+                 n_cls, mlp_ratio=4., attn_ratio=4,
                  activation=nn.ReLU, norm='bn'):
         super(MobileInst, self).__init__()
-        self.backbone = backbone
         self.se_decoder = SEMaskDecoder(channels, dim, activation, norm)
-        self.dual_decoder = DualInstanceDecoder(dim, key_dim, num_heads, n_cls, mlp_ratio, attn_ratio, activation, norm)
+        self.dual_decoder = DualInstanceDecoder(
+            dim, num_kernels, key_dim, num_heads, n_cls, mlp_ratio, attn_ratio, activation, norm)
 
-    def forward(self, x):
+    def forward(self, x, features):
         _, __, H, W = get_shape(x)
-        features = self.backbone(x)
         x_g = features[-1]
         x_l = features[:-1]
-        x_l = [F.interpolate(x, size=(H//8, W//8), mode='bilinear', align_corners=False) for x in x_l]
-        x_g = F.interpolate(x_g, size=(H//8, W//8), mode='bilinear', align_corners=False)
         x_mask = self.se_decoder(x_l, x_g)
-        x_l = F.interpolate(x_mask, size=(H//64, W//64), mode='bilinear', align_corners=False)
+        x_l = F.adaptive_max_pool2d(x_mask, output_size=(H//64, W//64))
         x_g = F.interpolate(x_g, size=(H//64, W//64), mode='bilinear', align_corners=False)
         pred_logits, pred_kernels, pred_scores = self.dual_decoder(x_l, x_g)
         mask_shape = get_shape(x_mask)
