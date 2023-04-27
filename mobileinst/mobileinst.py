@@ -297,7 +297,8 @@ class MobileInst(nn.Module):
         x_g = F.interpolate(x_g, size=(H//64, W//64), mode='bilinear', align_corners=False)
         pred_logits, pred_kernels, pred_scores = self.dual_decoder(x_l, x_g)
         mask_shape = get_shape(x_mask)
-        pred_masks = torch.bmm(pred_kernels, x_mask.view(mask_shape[0], mask_shape[1], -1)).view(*mask_shape)
+        pred_masks = torch.bmm(pred_kernels, x_mask.view(mask_shape[0], mask_shape[1], -1)).view(
+            mask_shape[0], -1, mask_shape[2], mask_shape[3])
         pred_masks = F.interpolate(pred_masks, size=(H, W), mode='bilinear', align_corners=False)
         return {
             'pred_logits': pred_logits,
