@@ -275,16 +275,21 @@ class DualInstanceDecoder(nn.Module):
 
 
 class MobileInst(nn.Module):
-    def __init__(self, channels, dim, num_kernels, key_dim, num_heads,
+    def __init__(self, backbone, channels, dim, num_kernels, key_dim, num_heads,
                  n_cls, mlp_ratio=4., attn_ratio=4,
                  activation=nn.ReLU, norm='bn'):
         super(MobileInst, self).__init__()
+        if backbone is not None:
+            self.backbone = backbone
         self.se_decoder = SEMaskDecoder(channels, dim, activation, norm)
         self.dual_decoder = DualInstanceDecoder(
             dim, num_kernels, key_dim, num_heads, n_cls, mlp_ratio, attn_ratio, activation, norm)
 
-    def forward(self, x, features):
+    def forward(self, x, features=None):
         _, __, H, W = get_shape(x)
+        if features is None:
+            assert hasattr(self, 'backbone')
+            features = self.backbone(x)
         x_g = features[-1]
         x_l = features[:-1]
         x_mask = self.se_decoder(x_l, x_g)
