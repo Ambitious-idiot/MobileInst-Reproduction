@@ -17,7 +17,7 @@ def train(args):
     train_dataloader = mobileinst.build_train_dataloader(args.root, args.n_cls, args.batch_size)
 
     backbone = mobileinst.backbones.get_topformer(device)
-    model = mobileinst.MobileInst(backbone, args.channels, args.dim, args.key_dim, args.num_heads,
+    model = mobileinst.MobileInst(backbone, args.channels, args.dim, args.num_kernels, args.key_dim, args.num_heads,
                                   args.n_cls, args.mlp_ratios, args.attn_ratios).to(device)
     matcher = mobileinst.MobileInstMatcher(args.alpha, args.beta, args.dim, device)
     criterion = mobileinst.MobileInstCriterion(

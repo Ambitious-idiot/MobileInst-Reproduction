@@ -15,6 +15,7 @@ def parse_args():
     # MobileInst
     parser.add_argument('--channels', type=tuple, default=(128, 128, 128), help='Output channels of backbone')
     parser.add_argument('--dim', type=int, default=128, help='Kernel dim')
+    parser.add_argument('--num_kernels', type=int, default=100, help='Number of kernels of attention')
     parser.add_argument('--key_dim', type=int, default=16, help='Key dim of attention')
     parser.add_argument('--num_heads', type=int, default=8, help='Head of attention')
     parser.add_argument('--attn_ratios', type=int, default=2, help='Attention ratios')

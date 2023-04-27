@@ -7,7 +7,7 @@ import utils
 device = torch.device('cpu')
 args = utils.parse_args()
 backbone = mobileinst.backbones.get_topformer(device)
-model = mobileinst.MobileInst(backbone, args.channels, args.dim, args.key_dim, args.num_heads,
+model = mobileinst.MobileInst(backbone, args.channels, args.dim, args.num_kernels, args.key_dim, args.num_heads,
                               args.n_cls, args.mlp_ratios, args.attn_ratios).to(device)
 
 checkpoint = os.path.join(args.checkpoint_root, args.checkpoint)
