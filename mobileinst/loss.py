@@ -130,11 +130,11 @@ class MobileInstCriterion(nn.Module):
 
 
 class MobileInstMatcher:
-    def __init__(self, alpha, beta, dim, device):
+    def __init__(self, alpha, beta, num_cands, device):
         self.alpha = alpha
         self.beta = beta
         self.mask_score = dice_score
-        self.dim = dim
+        self.num_cands = num_cands
         self.device = device
 
     def __call__(self, outputs, targets):
@@ -167,6 +167,6 @@ class MobileInstMatcher:
                 c = (mask_score ** self.alpha) * (matching_prob ** self.beta)
                 # hungarian matching
                 src, tgt = linear_sum_assignment(c.cpu(), maximize=True)
-                src = np.hstack([src, np.setdiff1d(np.arange(self.dim), src, True)])
+                src = np.hstack([src, np.setdiff1d(np.arange(self.num_cands), src, True)])
                 indices.append((src, tgt))
             return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices]
