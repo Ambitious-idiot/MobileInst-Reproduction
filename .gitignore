@@ -1,3 +1,8 @@
 .idea
-__pycache__/
+.vscode
+checkpoints
+out
+__pycache__
 *.pth
+*.out
+*.ipynb

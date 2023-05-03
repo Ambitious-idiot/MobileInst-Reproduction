@@ -3,12 +3,11 @@ from torchvision.transforms.functional import normalize
 import numpy as np
 import pycocotools.mask as mask_util
 from pycocotools.cocoeval import COCOeval
-from detectron2.structures import BitMasks
 from typing import Dict
 import os
 import json
 from .dataloader import CocoInstanceSegmentationDataset
-import cv2
+
 
 class Evaluator:
     def __init__(self, args, model, device):
@@ -56,7 +55,7 @@ class Evaluator:
         masks_pred = masks > self.mask_thres
         # rescoring mask using maskness
         scores = rescoring_mask(scores, masks_pred, masks)
-        result['pred_masks'] = BitMasks(masks_pred)
+        result['pred_masks'] = masks_pred
         result['scores'] = scores
         result['pred_classes'] = labels + 1
         result['num_instance'] = len(scores)
@@ -109,19 +108,6 @@ def result2coco(result: Dict, img_id: int):
             'image_id': img_id,
             "category_id": classes[i],
             "score": scores[i],
-            # "segmentation": mask2ann(result['pred_masks'][i].numpy())
             "segmentation": rles[i]
         } for i in range(num_instance)
     ]
-
-
-def mask2ann(mask):
-    """将二进制掩模转换为COCO标注字典"""
-    mask = np.asfortranarray(mask.astype(np.uint8))
-    contour, _ = cv2.findContours(mask.copy(), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_TC89_L1)
-    segmentation = []
-    for c in contour:
-        segmentation.append(c.flatten().tolist())
-    rle = mask_util.frPyObjects(segmentation, mask.shape[0], mask.shape[1])
-    rle = mask_util.merge(rle)
-    return rle

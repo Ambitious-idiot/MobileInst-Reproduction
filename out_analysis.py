@@ -41,7 +41,7 @@ for k, v in losses.items():
     plt.grid()
     v = v[args.start:]
     v = np.array(10 * np.log10(v)) if args.db else v
-    plt.plot(v)
+    plt.plot(np.arange(len(v)) + args.start, v)
     if args.db:
         plt.ylabel('dB')
     else:
@@ -52,7 +52,7 @@ for k, v in losses.items():
 plt.figure()
 tot_loss = sum([np.array(v) for v in losses.values()])[args.start:]
 tot_loss = np.array(10 * np.log10(tot_loss)) if args.db else tot_loss
-plt.plot(tot_loss)
+plt.plot(np.arange(len(tot_loss)) + args.start, tot_loss)
 if args.db:
     plt.ylabel('dB')
 else:
