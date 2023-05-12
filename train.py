@@ -67,7 +67,7 @@ def train(args):
                 'epoch': epoch,
                 'scheduler': scheduler.state_dict()
             }
-            torch.save(checkpoint, os.path.join(args.checkpoint_root, 'mobileinst%04d.pth' % (epoch+1)))
+            torch.save(checkpoint, os.path.join(args.checkpoint_root, 'mobileinst%05d.pth' % (epoch+1)))
 
 
 if __name__ == '__main__':

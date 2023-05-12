@@ -38,8 +38,8 @@ def parse_args():
     parser.add_argument('--obj_weight', type=float, default=1, help='Weight of objectness')
     parser.add_argument('--alpha', type=float, default=0.8, help='Weight of mask score in matcher')
     parser.add_argument('--beta', type=float, default=0.2, help='Weight of class score in matcher')
-    # Validation Config
-    parser.add_argument('--cls_thres', type=float, default=0.2, help='Score threshold for inference')
+    # validation config
+    parser.add_argument('--cls_thres', type=float, default=0.3, help='Score threshold for inference')
     parser.add_argument('--mask_thres', type=float, default=0.45, help='Mask threshold for inference')
     parser.add_argument('--out_root', type=str, default='./out', help='Root of output results')
     return parser.parse_args()

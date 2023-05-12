@@ -11,8 +11,8 @@ from .dataloader import CocoInstanceSegmentationDataset
 
 class Evaluator:
     def __init__(self, args, model, device):
-        self.dataset = CocoInstanceSegmentationDataset(args.root, 'val', 20)
-        self.image_ids  = self.dataset.image_ids
+        self.dataset = CocoInstanceSegmentationDataset(args.root, 'train', 20)
+        self.image_ids = self.dataset.image_ids
         self.coco = self.dataset.coco
         self.model = model.eval().to(device)
         self.cls_thres = args.cls_thres
