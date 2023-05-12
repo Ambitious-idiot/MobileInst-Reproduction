@@ -48,3 +48,11 @@
 5.12更新
 
 发现原实现中的backbone部分有一些问题，同时对照SparseInst对模型细节做了一些修改，换用Detectron2实现。代码保存在./mobileinst-detectron2中。
+
+测试集上结果很差，我用中间保存的模型参数进行测试AP均没有超过0.05。我clone了SparseInst在数据集上训练了144000个iter后结果与以上验证集结果差不多，所以怀疑是训练集数据量太少训不出能够足够拟合的模型。
+
+SparseInst训练144000个iter后的验证集结果：
+![](assets/SparseInst_val.png)
+MobileInst（TopFormer_base作为backbone）训练144000个iter后的训练集结果：
+![](assets/MobileInst_train.png)
+
