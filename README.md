@@ -44,3 +44,7 @@
 验证集AP结果如下：
 ![](assets/ap_test_v1.png)
 
+---
+5.12更新
+
+发现原实现中的backbone部分有一些问题，同时对照SparseInst对模型细节做了一些修改，换用Detectron2实现。代码保存在./mobileinst-detectron2中。
