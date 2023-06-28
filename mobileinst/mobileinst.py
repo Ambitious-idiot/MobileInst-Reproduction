@@ -1,307 +1,181 @@
+# Copyright (c) Tianheng Cheng and its affiliates. All Rights Reserved
+
 import torch
 from torch import nn
 import torch.nn.functional as F
-import math
-from detectron2.layers import NaiveSyncBatchNorm, FrozenBatchNorm2d
+
+from detectron2.modeling import build_backbone
+from detectron2.structures import ImageList, Instances, BitMasks
+from detectron2.modeling import META_ARCH_REGISTRY, build_backbone
+
+from .encoder import build_mobileinst_encoder
+from .decoder import build_mobileinst_decoder
+from .loss import build_mobileinst_criterion
+from .utils import nested_tensor_from_tensor_list
 
 
-def get_shape(tensor):
-    shape = tensor.shape
-    if torch.onnx.is_in_onnx_export():
-        shape = [i.cpu().numpy() for i in shape]
-    return shape
+__all__ = ["MobileInst"]
 
 
-class SemanticEnhancer(nn.Module):
-    def __init__(self, in_local, in_glob, out_feat):
-        super(SemanticEnhancer, self).__init__()
-        self.in_local = in_local
-        self.in_glob = in_glob
-        self.out_feat = out_feat
-
-        self.lateral_l = Conv2d_BN(in_local, out_feat)
-        self.lateral_g = Conv2d_BN(in_glob, out_feat)
-        self.out_layer = Conv2d_BN(out_feat, out_feat)
-
-    def forward(self, x_l, x_g):
-        x_l = F.relu_(self.lateral_l(x_l))
-        x_g = F.relu_(self.lateral_g(x_g))
-        features = x_l * x_g + x_g
-        features = F.relu_(self.out_layer(features))
-        return features
+@torch.jit.script
+def rescoring_mask(scores, mask_pred, masks):
+    mask_pred_ = mask_pred.float()
+    return scores * ((masks * mask_pred_).sum([1, 2]) / (mask_pred_.sum([1, 2]) + 1e-6))
 
 
-class Conv2d_BN(nn.Sequential):
-    def __init__(self, a, b, ks=1, stride=1, pad=0, dilation=1,
-                 groups=1, bn_weight_init=1, norm='BN'):
-        super().__init__()
-        self.inp_channel = a
-        self.out_channel = b
-        self.ks = ks
-        self.pad = pad
-        self.stride = stride
-        self.dilation = dilation
-        self.groups = groups
-
-        self.add_module('c', nn.Conv2d(
-            a, b, ks, stride, pad, dilation, groups, bias=False))
-        if norm == "FrozenBN":
-            bn = FrozenBatchNorm2d(b)
-        elif norm == "SyncBN":
-            bn = NaiveSyncBatchNorm(b)
-        else:
-            bn = nn.BatchNorm2d(b)
-        nn.init.constant_(bn.weight, bn_weight_init)
-        nn.init.constant_(bn.bias, 0)
-        self.add_module('bn', bn)
-
-
-class SEMaskDecoder(nn.Module):
-    def __init__(self, channels, dim, activation=nn.ReLU, norm='bn'):
-        super(SEMaskDecoder, self).__init__()
-        self.n_local = len(channels) - 1
-        self.injections = nn.ModuleList()
-        for channel in channels:
-            self.injections.append(nn.Sequential(Conv2d_BN(channel, dim, norm=norm), activation(inplace=True)))
-        self.se1 = SemanticEnhancer(dim, dim, dim)
-        self.conv1 = nn.ModuleList()
-        for _ in range(self.n_local):
-            self.conv1.append(nn.Sequential(Conv2d_BN(dim, dim, 3, 1, 1, norm=norm), activation(inplace=True)))
-        self.conv2 = nn.ModuleList()
-        for _ in range(self.n_local):
-            self.conv2.append(nn.Sequential(Conv2d_BN(dim, dim, 3, 1, 1, norm=norm), activation(inplace=True)))
-        self.se2 = SemanticEnhancer(dim, dim, dim)
-
-    def forward(self, x_l, x_g):
-        x_l = [self.injections[i](x_l[i]) for i in range(self.n_local)]
-        x_g = self.injections[-1](x_g)
-        x_g = F.interpolate(x_g, size=x_l[-1].shape[-2:], mode='nearest')
-        stage1 = [self.se1(x_l[-1], x_g)]
-        for i in range(self.n_local-2, -1, -1):
-            up_feature = F.interpolate(stage1[-1], size=x_l[i].shape[-2:], mode='nearest')
-            stage1.append(up_feature+x_l[i])
-        stage1 = stage1[::-1]
-        stage1 = [self.conv1[i](stage1[i]) for i in range(self.n_local)]
-        stage2 = [stage1[0]]
-        for i in range(1, len(stage1)):
-            down_feature = F.interpolate(
-                stage2[-1], size=stage1[i].shape[-2:], mode='nearest')
-            stage2.append(down_feature+stage1[i])
-        stage2 = [self.conv2[i](stage2[i]) for i in range(self.n_local)]
-        out = self.se2(stage2[-1], x_g)
-        for i in range(len(stage2)-1):
-            out = F.interpolate(out, size=stage2[i].shape[-2:], mode='nearest')
-            out = out + stage2[i]
-        return out
-
-
-class BaseAttention(nn.Module):
-    def __init__(self, dim, num_kernels, key_dim, num_heads, attn_ratio=4,
-                 activation=nn.ReLU, norm='bn'):
-        super(BaseAttention, self).__init__()
-        self.dim = dim
-        self.num_kernels = num_kernels
-        self.num_heads = num_heads
-        self.key_dim = key_dim
-        self.nh_kd = key_dim * num_heads
-        self.scale = key_dim ** -0.5
-        self.d = int(attn_ratio * key_dim)
-        self.dh = int(attn_ratio * key_dim) * num_heads
-        self.attn_ratio = attn_ratio
-        self.to_q = nn.Sequential(nn.Linear(dim, self.nh_kd), nn.BatchNorm1d(self.nh_kd))
-        self.to_k = Conv2d_BN(dim, self.nh_kd, norm=norm)
-        self.to_v = Conv2d_BN(dim, self.dh, norm=norm)
-        self.proj = nn.Sequential(activation(), nn.Linear(self.dh, dim), nn.BatchNorm1d(dim))
-
-    def _attention(self, q, k, v, B):
-        # Q: B*NH*NK*KD K: B*NH*KD*HW V: B*NH*HW*D Out: B*NK*C
-        attn = torch.matmul(q, k)
-        attn = attn.softmax(dim=-1)
-        x = torch.matmul(attn, v)
-        x = x.permute(0, 1, 3, 2).reshape(B, self.dh, self.num_kernels).permute(0, 2, 1).reshape(-1, self.dh)
-        return self.proj(x).reshape(-1, self.num_kernels, self.dim)
-
-    def attention(self, q, k, v, B):
-        # Q: B*NK*C K: B*C*H*W V: B*C*H*W Out: B*NK*C
-        Q = q.reshape(-1, self.dim)
-        Q = self.to_q(Q).reshape(B, self.num_kernels, self.num_heads, self.key_dim).permute(0, 2, 1, 3)
-        K = self.to_k(k).reshape(B, self.num_heads, self.key_dim, -1)
-        V = self.to_v(v).reshape(B, self.num_heads, self.d, -1).permute(0, 1, 3, 2)
-        return self._attention(Q, K, V, B) + q
-
-
-class FixedQAttention(BaseAttention):
-    def __init__(self, dim, num_kernels, key_dim, num_heads, attn_ratio=4,
-                 activation=nn.ReLU, norm='bn'):
-        super(FixedQAttention, self).__init__(dim, num_kernels, key_dim, num_heads, attn_ratio, activation, norm)
-        self.q = nn.Parameter(torch.randn(1, num_kernels, dim))
-
-    def forward(self, x):
-        B, *_ = get_shape(x)
-        q = self.q.repeat(B, 1, 1)
-        return self.attention(q, x, x, B)
-
-
-class CrossAttention(BaseAttention):
-    def __init__(self, dim, num_kernels, key_dim, num_heads, attn_ratio=4,
-                 activation=nn.ReLU, norm='bn'):
-        super(CrossAttention, self).__init__(dim, num_kernels, key_dim, num_heads, attn_ratio, activation, norm)
-
-    def forward(self, x, y):
-        B, *_ = get_shape(x)
-        return self.attention(y, x, x, B)
-
-
-class SelfAttention(BaseAttention):
-    def __init__(self, dim, num_kernels, key_dim, num_heads, attn_ratio=4,
-                 activation=nn.ReLU, norm='bn'):
-        super(SelfAttention, self).__init__(dim, num_kernels, key_dim, num_heads, attn_ratio, activation, norm)
-        self.to_k = nn.Sequential(nn.Linear(dim, self.nh_kd), nn.BatchNorm1d(self.nh_kd))
-        self.to_v = nn.Sequential(nn.Linear(dim, self.dh), nn.BatchNorm1d(self.dh))
-
-    def attention(self, q, k, v, B):
-        # Q: B*N*C K: B*N*C V: B*N*C Out: B*N*C
-        Q = q.reshape(-1, self.dim)
-        Q = self.to_q(Q).reshape(B, self.num_kernels, self.num_heads, self.key_dim).permute(0, 2, 1, 3)
-        K = k.reshape(-1, self.dim)
-        K = self.to_k(K).reshape(B, self.num_kernels, self.num_heads, self.key_dim).permute(0, 2, 3, 1)
-        V = v.reshape(-1, self.dim)
-        V = self.to_v(V).reshape(B, self.num_kernels, self.num_heads, self.d).permute(0, 2, 1, 3)
-        return self._attention(Q, K, V, B) + q
-
-    def forward(self, x):
-        B, *_ = get_shape(x)
-        return self.attention(x, x, x, B)
-
-
-class MLP(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.ReLU):
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = act_layer(inplace=True)
-        self.fc2 = nn.Linear(hidden_features, out_features)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.fc2(x)
-        x = self.act(x)
-        return x
-
-
-class PositionEmbeddingSine(nn.Module):
-    """
-    This is a more standard version of the position embedding, very similar to the one
-    used by the Attention is all you need paper, generalized to work on images.
-    """
-
-    def __init__(self, num_pos_feats=64, temperature=10000, normalize=False, scale=None):
-        super().__init__()
-        self.num_pos_feats = num_pos_feats
-        self.temperature = temperature
-        self.normalize = normalize
-        if scale is not None and normalize is False:
-            raise ValueError("normalize should be True if scale is passed")
-        if scale is None:
-            scale = 2 * math.pi
-        self.scale = scale
-
-    def forward(self, x, mask=None):
-        if mask is None:
-            mask = torch.zeros((x.size(0), x.size(2), x.size(3)), device=x.device, dtype=torch.bool)
-        not_mask = ~mask
-        y_embed = not_mask.cumsum(1, dtype=torch.float32)
-        x_embed = not_mask.cumsum(2, dtype=torch.float32)
-        if self.normalize:
-            eps = 1e-6
-            y_embed = y_embed / (y_embed[:, -1:, :] + eps) * self.scale
-            x_embed = x_embed / (x_embed[:, :, -1:] + eps) * self.scale
-
-        dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=x.device)
-        dim_t = self.temperature ** (2 * (dim_t // 2) / self.num_pos_feats)
-
-        pos_x = x_embed[:, :, :, None] / dim_t
-        pos_y = y_embed[:, :, :, None] / dim_t
-        pos_x = torch.stack(
-            (pos_x[:, :, :, 0::2].sin(), pos_x[:, :, :, 1::2].cos()), dim=4
-        ).flatten(3)
-        pos_y = torch.stack(
-            (pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4
-        ).flatten(3)
-        pos = torch.cat((pos_y, pos_x), dim=3).permute(0, 3, 1, 2)
-        return pos
-
-
-class PredictionHead(nn.Module):
-    def __init__(self, dim, n_cls):
-        super(PredictionHead, self).__init__()
-        self.dim = dim
-        self.n_cls = n_cls
-        self.cls = nn.Linear(dim, n_cls)
-        self.objectness = nn.Linear(dim, 1)
-        self.kernel = nn.Linear(dim, dim)
-
-    def forward(self, x):
-        pred_logits = self.cls(x)
-        pred_kernel = self.kernel(x)
-        pred_scores = self.objectness(x)
-        return pred_logits, pred_kernel, pred_scores
-
-
-class DualInstanceDecoder(nn.Module):
-    def __init__(self, dim, num_kernels, key_dim, num_heads, n_cls, mlp_ratio=4., attn_ratio=4,
-                 activation=nn.ReLU, norm='bn'):
-        super(DualInstanceDecoder, self).__init__()
-        self.pe = PositionEmbeddingSine(dim//2, normalize=True)
-        self.g_d1 = FixedQAttention(dim, num_kernels, key_dim, num_heads, attn_ratio, activation, norm)
-        self.g_d2 = SelfAttention(dim, num_kernels, key_dim, num_heads, attn_ratio, activation, norm)
-        self.l_d1 = CrossAttention(dim, num_kernels, key_dim, num_heads, attn_ratio, activation, norm)
-        self.l_d2 = SelfAttention(dim, num_kernels, key_dim, num_heads, attn_ratio, activation, norm)
-        self.mlp = MLP(dim, int(dim*mlp_ratio), act_layer=activation)
-        self.head = PredictionHead(dim, n_cls)
-
-    def forward(self, x_l, x_g):
-        x_l = x_l + self.pe(x_l)
-        x_g = x_g + self.pe(x_g)
-        q = self.g_d1(x_g)
-        q = self.g_d2(q)
-        q = self.l_d1(x_l, q)
-        q = self.l_d2(q)
-        q = self.mlp(q)
-        pred_logits, pred_kernel, pred_scores = self.head(q)
-        return pred_logits, pred_kernel, pred_scores
-
-
+@META_ARCH_REGISTRY.register()
 class MobileInst(nn.Module):
-    def __init__(self, backbone, channels, dim, num_kernels, key_dim, num_heads,
-                 n_cls, mlp_ratio=4., attn_ratio=4,
-                 activation=nn.ReLU, norm='bn'):
-        super(MobileInst, self).__init__()
-        if backbone is not None:
-            self.backbone = backbone
-        self.se_decoder = SEMaskDecoder(channels, dim, activation, norm)
-        self.dual_decoder = DualInstanceDecoder(
-            dim, num_kernels, key_dim, num_heads, n_cls, mlp_ratio, attn_ratio, activation, norm)
+    def __init__(self, cfg):
+        super().__init__()
 
-    def forward(self, x, features=None):
-        _, __, H, W = get_shape(x)
-        if features is None:
-            assert hasattr(self, 'backbone')
-            features = self.backbone(x)
-        x_g = features[-1]
-        x_l = features[:-1]
-        x_mask = self.se_decoder(x_l, x_g)
-        x_l = F.adaptive_max_pool2d(x_mask, output_size=(H//64, W//64))
-        x_g = F.interpolate(x_g, size=(H//64, W//64), mode='bilinear', align_corners=False)
-        pred_logits, pred_kernels, pred_scores = self.dual_decoder(x_l, x_g)
-        mask_shape = get_shape(x_mask)
-        pred_masks = torch.bmm(pred_kernels, x_mask.view(mask_shape[0], mask_shape[1], -1)).view(
-            mask_shape[0], -1, mask_shape[2], mask_shape[3])
-        pred_masks = F.interpolate(pred_masks, size=(H, W), mode='bilinear', align_corners=False)
-        return {
-            'pred_logits': pred_logits,
-            'pred_scores': pred_scores,
-            'pred_masks': pred_masks
-        }
+        # move to target device
+        self.device = torch.device(cfg.MODEL.DEVICE)
+
+        # backbone
+        self.backbone = build_backbone(cfg)
+        self.size_divisibility = self.backbone.size_divisibility
+        output_shape = self.backbone.output_shape()
+
+        # encoder & decoder
+        self.encoder = build_mobileinst_encoder(cfg, output_shape)
+        self.decoder = build_mobileinst_decoder(cfg)
+
+        # matcher & loss (matcher is built in loss)
+        self.criterion = build_mobileinst_criterion(cfg)
+
+        # data and preprocessing
+        self.mask_format = cfg.INPUT.MASK_FORMAT
+
+        self.pixel_mean = torch.Tensor(
+            cfg.MODEL.PIXEL_MEAN).to(self.device).view(3, 1, 1)
+        self.pixel_std = torch.Tensor(
+            cfg.MODEL.PIXEL_STD).to(self.device).view(3, 1, 1)
+
+        # inference
+        self.cls_threshold = cfg.MODEL.MOBILEINST.CLS_THRESHOLD
+        self.mask_threshold = cfg.MODEL.MOBILEINST.MASK_THRESHOLD
+        self.max_detections = cfg.MODEL.MOBILEINST.MAX_DETECTIONS
+
+    def normalizer(self, image):
+        image = (image - self.pixel_mean) / self.pixel_std
+        return image
+
+    def preprocess_inputs(self, batched_inputs):
+        images = [x["image"].to(self.device) for x in batched_inputs]
+        images = [self.normalizer(x) for x in images]
+        images = ImageList.from_tensors(images, 32)
+        return images
+
+    def prepare_targets(self, targets):
+        new_targets = []
+        for targets_per_image in targets:
+            target = {}
+            gt_classes = targets_per_image.gt_classes
+            target["labels"] = gt_classes.to(self.device)
+            h, w = targets_per_image.image_size
+            if not targets_per_image.has('gt_masks'):
+                gt_masks = BitMasks(torch.empty(0, h, w))
+            else:
+                gt_masks = targets_per_image.gt_masks
+                if self.mask_format == "polygon":
+                    if len(gt_masks.polygons) == 0:
+                        gt_masks = BitMasks(torch.empty(0, h, w))
+                    else:
+                        gt_masks = BitMasks.from_polygon_masks(
+                            gt_masks.polygons, h, w)
+
+            target["masks"] = gt_masks.to(self.device)
+            new_targets.append(target)
+
+        return new_targets
+
+    def forward(self, batched_inputs):
+        images = self.preprocess_inputs(batched_inputs)
+        if isinstance(images, (list, torch.Tensor)):
+            images = nested_tensor_from_tensor_list(images)
+        max_shape = images.tensor.shape[2:]
+        # forward
+        features = self.backbone(images.tensor)
+        features = self.encoder(features)
+        output = self.decoder(features)
+
+        if self.training:
+            gt_instances = [x["instances"].to(
+                self.device) for x in batched_inputs]
+            targets = self.prepare_targets(gt_instances)
+            losses = self.criterion(output, targets, max_shape)
+            return losses
+        else:
+            results = self.inference(
+                output, batched_inputs, max_shape, images.image_sizes)
+            processed_results = [{"instances": r} for r in results]
+            return processed_results
+
+    def forward_test(self, images):
+        # for inference, onnx, tensorrt
+        # input images: BxCxHxW, fixed, need padding size
+        # normalize
+        images = (images - self.pixel_mean[None]) / self.pixel_std[None]
+        features = self.backbone(images)
+        features = self.encoder(features)
+        output = self.decoder(features)
+
+        pred_scores = output["pred_logits"].sigmoid()
+        pred_masks = output["pred_masks"].sigmoid()
+        pred_objectness = output["pred_scores"].sigmoid()
+        pred_scores = torch.sqrt(pred_scores * pred_objectness)
+        pred_masks = F.interpolate(
+            pred_masks, scale_factor=4.0, mode="bilinear", align_corners=False)
+        return pred_scores, pred_masks
+
+    def inference(self, output, batched_inputs, max_shape, image_sizes):
+        # max_detections = self.max_detections
+        results = []
+        pred_scores = output["pred_logits"].sigmoid()
+        pred_masks = output["pred_masks"].sigmoid()
+        pred_objectness = output["pred_scores"].sigmoid()
+        pred_scores = torch.sqrt(pred_scores * pred_objectness)
+
+        for _, (scores_per_image, mask_pred_per_image, batched_input, img_shape) in enumerate(zip(
+                pred_scores, pred_masks, batched_inputs, image_sizes)):
+
+            ori_shape = (batched_input["height"], batched_input["width"])
+            result = Instances(ori_shape)
+            # max/argmax
+            scores, labels = scores_per_image.max(dim=-1)
+            # cls threshold
+            keep = scores > self.cls_threshold
+            scores = scores[keep]
+            labels = labels[keep]
+            mask_pred_per_image = mask_pred_per_image[keep]
+
+            if scores.size(0) == 0:
+                result.scores = scores
+                result.pred_classes = labels
+                results.append(result)
+                continue
+
+            h, w = img_shape
+            # rescoring mask using maskness
+            scores = rescoring_mask(
+                scores, mask_pred_per_image > self.mask_threshold, mask_pred_per_image)
+
+            # upsample the masks to the original resolution:
+            # (1) upsampling the masks to the padded inputs, remove the padding area
+            # (2) upsampling/downsampling the masks to the original sizes
+            mask_pred_per_image = F.interpolate(
+                mask_pred_per_image.unsqueeze(1), size=max_shape, mode="bilinear", align_corners=False)[:, :, :h, :w]
+            mask_pred_per_image = F.interpolate(
+                mask_pred_per_image, size=ori_shape, mode='bilinear', align_corners=False).squeeze(1)
+
+            mask_pred = mask_pred_per_image > self.mask_threshold
+            # fix the bug for visualization
+            # mask_pred = BitMasks(mask_pred)
+
+            # using Detectron2 Instances to store the final results
+            result.pred_masks = mask_pred
+            result.scores = scores
+            result.pred_classes = labels
+            results.append(result)
+
+        return results

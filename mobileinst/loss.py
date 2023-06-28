@@ -1,9 +1,18 @@
 import torch
-import torch.nn as nn
+from torch import nn
 import torch.nn.functional as F
-import numpy as np
+from torch.cuda.amp import autocast
 from scipy.optimize import linear_sum_assignment
 from fvcore.nn import sigmoid_focal_loss_jit
+from detectron2.utils.registry import Registry
+
+from .utils import nested_masks_from_list, is_dist_avail_and_initialized, get_world_size
+
+
+MOBILEINST_MATCHER_REGISTRY = Registry('MOBILEINST_MATCHER')
+MOBILEINST_MATCHER_REGISTRY.__doc__ = "Matcher for MobileInst"
+MOBILEINST_CRITERION_REGISTRY = Registry("MOBILEINST_CRITERION")
+MOBILEINST_CRITERION_REGISTRY.__doc__ = "Criterion for MobileInst"
 
 
 def compute_mask_iou(inputs, targets):
@@ -38,19 +47,27 @@ def dice_loss(inputs, targets, reduction='sum'):
     return loss.sum()
 
 
+@ MOBILEINST_CRITERION_REGISTRY.register()
 class MobileInstCriterion(nn.Module):
     # This part is partially derivated from: https://github.com/facebookresearch/detr/blob/main/models/detr.py
-    def __init__(self, weights, n_cls, matcher, device):
+    def __init__(self, cfg, matcher):
         super().__init__()
         self.matcher = matcher
-        self.losses = ('labels', 'masks')
-        self.weight_dict = self.get_weight_dict(weights)
-        self.num_classes = n_cls
-        self.device = device
+        self.losses = cfg.MODEL.MOBILEINST.LOSS.ITEMS
+        self.weight_dict = self.get_weight_dict(cfg)
+        self.num_classes = cfg.MODEL.MOBILEINST.DECODER.NUM_CLASSES
 
-    def get_weight_dict(self, weights):
+    def get_weight_dict(self, cfg):
         losses = ("loss_ce", "loss_mask", "loss_dice", "loss_objectness")
-        return dict(zip(losses, weights))
+        weight_dict = {}
+        ce_weight = cfg.MODEL.MOBILEINST.LOSS.CLASS_WEIGHT
+        mask_weight = cfg.MODEL.MOBILEINST.LOSS.MASK_PIXEL_WEIGHT
+        dice_weight = cfg.MODEL.MOBILEINST.LOSS.MASK_DICE_WEIGHT
+        objectness_weight = cfg.MODEL.MOBILEINST.LOSS.OBJECTNESS_WEIGHT
+
+        weight_dict = dict(
+            zip(losses, (ce_weight, mask_weight, dice_weight, objectness_weight)))
+        return weight_dict
 
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
@@ -66,15 +83,24 @@ class MobileInstCriterion(nn.Module):
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         return batch_idx, tgt_idx
 
-    def loss_labels(self, outputs, targets, indices, num_instances):
+    def loss_labels(self, outputs, targets, indices, num_instances, input_shape):
+        assert "pred_logits" in outputs
         src_logits = outputs['pred_logits']
+        idx = self._get_src_permutation_idx(indices)
+        target_classes_o = torch.cat([t["labels"][J]
+                                     for t, (_, J) in zip(targets, indices)])
+        target_classes = torch.full(src_logits.shape[:2], self.num_classes,
+                                    dtype=torch.int64, device=src_logits.device)
+        target_classes[idx] = target_classes_o
+
+        src_logits = src_logits.flatten(0, 1)
+        # prepare one_hot target.
+        target_classes = target_classes.flatten(0, 1)
+        pos_inds = torch.nonzero(
+            target_classes != self.num_classes, as_tuple=True)[0]
         labels = torch.zeros_like(src_logits)
-        src_idx = self._get_src_permutation_idx(indices)
-        src_logits = src_logits[src_idx]
-        tgt_idx = self._get_tgt_permutation_idx(indices)
-        targets = torch.cat(targets['labels']).to(self.device)
-        labels[tgt_idx] = targets.float()
-        labels = labels.flatten(0, 1).to(self.device)
+        labels[pos_inds, target_classes[pos_inds]] = 1
+        # comp focal loss.
         class_loss = sigmoid_focal_loss_jit(
             src_logits,
             labels,
@@ -85,42 +111,87 @@ class MobileInstCriterion(nn.Module):
         losses = {'loss_ce': class_loss}
         return losses
 
-    def loss_masks_with_iou_objectness(self, outputs, targets, indices, num_instances):
-        indices = [(i[0][:len(i[1])], i[1]) for i in indices]
+    def loss_masks_with_iou_objectness(self, outputs, targets, indices, num_instances, input_shape):
         src_idx = self._get_src_permutation_idx(indices)
+        tgt_idx = self._get_tgt_permutation_idx(indices)
+        # Bx100xHxW
+        assert "pred_masks" in outputs
+        assert "pred_scores" in outputs
+        src_iou_scores = outputs["pred_scores"]
         src_masks = outputs["pred_masks"]
-        tgt_masks = targets['masks']
-        tgt_masks = [mask[index[1]] for mask, index in zip(tgt_masks, indices)]
-        tgt_masks = torch.cat(tgt_masks)
-        tgt_masks = F.interpolate(tgt_masks.unsqueeze(1), size=src_masks.shape[-2:], mode='nearest').squeeze(1)
-        src_masks = src_masks[src_idx].flatten(1)
-        tgt_masks = tgt_masks.float().flatten(1).to(self.device)
-        src_iou_scores = outputs["pred_scores"][src_idx].flatten(0)
         with torch.no_grad():
-            tgt_iou_scores = compute_mask_iou(src_masks, tgt_masks).flatten(0)
+            target_masks, _ = nested_masks_from_list(
+                [t["masks"].tensor for t in targets], input_shape).decompose()
+        num_masks = [len(t["masks"]) for t in targets]
+        target_masks = target_masks.to(src_masks)
+        if len(target_masks) == 0:
+            losses = {
+                "loss_dice": src_masks.sum() * 0.0,
+                "loss_mask": src_masks.sum() * 0.0,
+                "loss_objectness": src_iou_scores.sum() * 0.0
+            }
+            return losses
+
+        src_masks = src_masks[src_idx]
+        target_masks = F.interpolate(
+            target_masks[:, None], size=src_masks.shape[-2:], mode='bilinear', align_corners=False).squeeze(1)
+
+        src_masks = src_masks.flatten(1)
+        # FIXME: tgt_idx
+        mix_tgt_idx = torch.zeros_like(tgt_idx[1])
+        cum_sum = 0
+        for num_mask in num_masks:
+            mix_tgt_idx[cum_sum: cum_sum + num_mask] = cum_sum
+            cum_sum += num_mask
+        mix_tgt_idx += tgt_idx[1]
+
+        target_masks = target_masks[mix_tgt_idx].flatten(1)
+
+        with torch.no_grad():
+            ious = compute_mask_iou(src_masks, target_masks)
+
+        tgt_iou_scores = ious
+        src_iou_scores = src_iou_scores[src_idx]
+        tgt_iou_scores = tgt_iou_scores.flatten(0)
+        src_iou_scores = src_iou_scores.flatten(0)
+
         losses = {
             "loss_objectness": F.binary_cross_entropy_with_logits(src_iou_scores, tgt_iou_scores, reduction='mean'),
-            "loss_dice": dice_loss(src_masks, tgt_masks) / num_instances,
-            "loss_mask": F.binary_cross_entropy_with_logits(src_masks, tgt_masks, reduction='mean')
+            "loss_dice": dice_loss(src_masks, target_masks) / num_instances,
+            "loss_mask": F.binary_cross_entropy_with_logits(src_masks, target_masks, reduction='mean')
         }
         return losses
 
-    def get_loss(self, loss, outputs, targets, indices, num_instances):
+    def get_loss(self, loss, outputs, targets, indices, num_instances, **kwargs):
         loss_map = {
             "labels": self.loss_labels,
             "masks": self.loss_masks_with_iou_objectness,
         }
-        return loss_map[loss](outputs, targets, indices, num_instances)
+        if loss == "loss_objectness":
+            # NOTE: loss_objectness will be calculated in `loss_masks_with_iou_objectness`
+            return {}
+        assert loss in loss_map
+        return loss_map[loss](outputs, targets, indices, num_instances, **kwargs)
 
-    def forward(self, outputs, targets):
-        indices = self.matcher(outputs, targets)
+    def forward(self, outputs, targets, input_shape):
+        outputs_without_aux = {k: v for k,
+                               v in outputs.items() if k != 'aux_outputs'}
+
+        # Retrieve the matching between the outputs of the last layer and the targets
+        indices = self.matcher(outputs_without_aux, targets, input_shape)
         # Compute the average number of target boxes accross all nodes, for normalization purposes
-        num_instances = sum(len(tl) for tl in targets['labels'])
-        num_instances = torch.as_tensor([num_instances], dtype=torch.float, device=self.device)
+        num_instances = sum(len(t["labels"]) for t in targets)
+        num_instances = torch.as_tensor(
+            [num_instances], dtype=torch.float, device=next(iter(outputs.values())).device)
+        if is_dist_avail_and_initialized():
+            torch.distributed.all_reduce(num_instances)
+        num_instances = torch.clamp(
+            num_instances / get_world_size(), min=1).item()
         # Compute all the requested losses
         losses = {}
         for loss in self.losses:
-            losses.update(self.get_loss(loss, outputs, targets, indices, num_instances))
+            losses.update(self.get_loss(loss, outputs, targets, indices,
+                                        num_instances, input_shape=input_shape))
 
         for k in losses.keys():
             if k in self.weight_dict:
@@ -129,44 +200,57 @@ class MobileInstCriterion(nn.Module):
         return losses
 
 
+@ MOBILEINST_MATCHER_REGISTRY.register()
 class MobileInstMatcher:
-    def __init__(self, alpha, beta, num_cands, device):
-        self.alpha = alpha
-        self.beta = beta
+    def __init__(self, cfg):
+        self.alpha = cfg.MODEL.MOBILEINST.MATCHER.ALPHA
+        self.beta = cfg.MODEL.MOBILEINST.MATCHER.BETA
         self.mask_score = dice_score
-        self.num_cands = num_cands
-        self.device = device
 
-    def __call__(self, outputs, targets):
+    def __call__(self, outputs, targets, input_shape):
         with torch.no_grad():
+            B, N, *_ = outputs["pred_masks"].shape
             pred_masks = outputs['pred_masks']
-            batch_size = len(pred_masks)
             pred_logits = outputs['pred_logits'].sigmoid()
 
-            indices = []
+            tgt_ids = torch.cat([v["labels"] for v in targets])
 
-            for i in range(batch_size):
-                target_labels = targets['labels'][i].to(self.device)
-                if target_labels.shape[0] == 0:
-                    indices.append((torch.as_tensor([]),
-                                    torch.as_tensor([])))
-                    continue
+            if tgt_ids.shape[0] == 0:
+                return [(torch.as_tensor([]).to(pred_logits), torch.as_tensor([]).to(pred_logits))] * B
+            tgt_masks, _ = nested_masks_from_list(
+                [t["masks"].tensor for t in targets], input_shape).decompose()
+            tgt_masks = tgt_masks.to(pred_masks)
 
-                tgt_masks = targets['masks'][i].to(self.device)
-                pred_logit = pred_logits[i]
-                out_masks = pred_masks[i]
-                tgt_masks = F.interpolate(
-                    tgt_masks.unsqueeze(1),size=out_masks.shape[-2:],
-                    mode='nearest').squeeze(1)
+            tgt_masks = F.interpolate(
+                tgt_masks[:, None], size=pred_masks.shape[-2:], mode="bilinear", align_corners=False).squeeze(1)
 
-                # compute dice score and classification score
-                tgt_masks = tgt_masks.flatten(1)
-                out_masks = out_masks.flatten(1)
-                mask_score = self.mask_score(out_masks, tgt_masks)
-                matching_prob = torch.matmul(pred_logit, target_labels.T.float())
-                c = (mask_score ** self.alpha) * (matching_prob ** self.beta)
-                # hungarian matching
-                src, tgt = linear_sum_assignment(c.cpu(), maximize=True)
-                src = np.hstack([src, np.setdiff1d(np.arange(self.num_cands), src, True)])
-                indices.append((src, tgt))
-            return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices]
+            pred_masks = pred_masks.view(B * N, -1)
+            tgt_masks = tgt_masks.flatten(1)
+            with autocast(enabled=False):
+                pred_masks = pred_masks.float()
+                tgt_masks = tgt_masks.float()
+                pred_logits = pred_logits.float()
+                mask_score = self.mask_score(pred_masks, tgt_masks)
+                # Nx(Number of gts)
+                matching_prob = pred_logits.view(B * N, -1)[:, tgt_ids]
+                C = (mask_score ** self.alpha) * (matching_prob ** self.beta)
+
+            C = C.view(B, N, -1).cpu()
+            # hungarian matching
+            sizes = [len(v["masks"]) for v in targets]
+            indices = [linear_sum_assignment(c[i], maximize=True)
+                       for i, c in enumerate(C.split(sizes, -1))]
+            indices = [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(
+                j, dtype=torch.int64)) for i, j in indices]
+            return indices
+
+
+def build_mobileinst_matcher(cfg):
+    name = cfg.MODEL.MOBILEINST.MATCHER.NAME
+    return MOBILEINST_MATCHER_REGISTRY.get(name)(cfg)
+
+
+def build_mobileinst_criterion(cfg):
+    matcher = build_mobileinst_matcher(cfg)
+    name = cfg.MODEL.MOBILEINST.LOSS.NAME
+    return MOBILEINST_CRITERION_REGISTRY.get(name)(cfg, matcher)

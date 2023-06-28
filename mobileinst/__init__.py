@@ -1,16 +1,8 @@
-from .dataloader import build_train_dataloader, build_val_dataloader
 from .mobileinst import MobileInst
-from .loss import MobileInstCriterion, MobileInstMatcher
-from . import backbones
-from .evaluator import Evaluator
-
-
-__all__ = [
-    'MobileInst',
-    'build_train_dataloader',
-    'build_val_dataloader',
-    'MobileInstCriterion',
-    'MobileInstMatcher',
-    'backbones',
-    'Evaluator',
-]
+from .config import add_mobileinst_config
+from .loss import build_mobileinst_criterion
+from .dataset_mapper import MobileInstDatasetMapper
+from .coco_evaluation import COCOMaskEvaluator
+from .backbones import build_topformer_backbone
+from .d2_predictor import VisualizationDemo
+from .decoder import *
