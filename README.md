@@ -45,7 +45,7 @@
 ![](assets/ap_test_v1.png)
 
 ---
-5.12更新
+5.**12更新**
 
 发现原实现中的backbone部分有一些问题，同时对照SparseInst对模型细节做了一些修改，换用Detectron2实现。代码保存在./mobileinst-detectron2中。
 
@@ -56,3 +56,10 @@ SparseInst训练144000个iter后的验证集结果：
 MobileInst（TopFormer_base作为backbone）训练144000个iter后的训练集结果：
 ![](assets/MobileInst_train.png)
 
+---
+6.28最终更新（之前因为服务器上不去所以没有上传最终结果直到今天才上传）
+
+破案了，读取预训练参数有问题，下游任务（尤其是用Transformer）没有预训练参数是训不出结果的
+
+最终的COCO测试集结果如下，与论文仅相差2个点左右：
+![](assets/final.png)
