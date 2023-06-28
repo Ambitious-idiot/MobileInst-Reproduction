@@ -1,0 +1,8 @@
+_BASE_: "Base-MobileInst.yaml"
+MODEL:
+  WEIGHTS: "/home/yuehaosong/MobileInst-detectron2/pretrained/TopFormer-base.pth"
+  BACKBONE:
+    NAME: "build_topformer_backbone"
+  TOPFORMER:
+    NAME: "topformer_base"
+OUTPUT_DIR: "output/mobileinst_topformer_base_coco"

@@ -1,35 +1,32 @@
 MODEL:
   META_ARCHITECTURE: "MobileInst"
-  WEIGHTS: ""
+  WEIGHTS: "/home/yuehaosong/MobileInst-detectron2/pretrained/TopFormer-base.pth"
   PIXEL_MEAN: [123.675, 116.280, 103.530]
   PIXEL_STD: [58.395, 57.120, 57.375]
-  BACKBONE:
-    FREEZE_AT: 0
-    NAME: "build_topformer_backbone"
   MOBILEINST:
     ENCODER:
       NAME: "SEMaskEncoder"
     DECODER:
       NAME: "MobileInstDecoder"
 DATASETS:
-  TRAIN: ("voc2012_cocostyle_train",)
-  TEST:  ("voc2012_cocostyle_val",)
+  TRAIN: ("coco_2017_train",)
+  TEST:  ("coco_2017_val",)
 SOLVER:
-  IMS_PER_BATCH: 16
+  IMS_PER_BATCH: 64
   BASE_LR: 0.00005
-  STEPS: (112000, 132000)
-  MAX_ITER: 144000
+  STEPS: (210000, 250000)
+  MAX_ITER: 270000
   WEIGHT_DECAY: 0.05
   BACKBONE_MULTIPLIER: 0.5
 INPUT:
-  MIN_SIZE_TRAIN: (448, 512, 576, 640)
+  MIN_SIZE_TRAIN: (416, 448, 480, 512, 544, 576, 608, 640)
   MAX_SIZE_TRAIN: 864
   MIN_SIZE_TEST: 640
   MAX_SIZE_TEST: 864
   FORMAT: "RGB"
   MASK_FORMAT: "bitmask"
 TEST:
-  EVAL_PERIOD: 6000
+  EVAL_PERIOD: 7330
 DATALOADER:
   NUM_WORKERS: 6
 VERSION: 2

@@ -126,7 +126,7 @@ class MobileInst(nn.Module):
         return result
 
 
-def test_mobileinst_speed(cfg, fp16=False):
+def test_sparseinst_speed(cfg, fp16=False):
     device = torch.device('cuda:0')
 
     model = MobileInst(cfg)
@@ -194,4 +194,4 @@ if __name__ == '__main__':
     args = args.parse_args()
     print("Command Line Args:", args)
     cfg = setup(args)
-    test_mobileinst_speed(cfg, fp16=args.fp16)
+    test_sparseinst_speed(cfg, fp16=args.fp16)

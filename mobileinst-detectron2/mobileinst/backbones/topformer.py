@@ -1,3 +1,4 @@
+from collections import OrderedDict
 import math
 import torch
 from torch import nn
@@ -5,7 +6,7 @@ import torch.nn.functional as F
 from fvcore.nn.weight_init import c2_xavier_fill
 from typing import Literal
 from detectron2.layers import ShapeSpec
-from detectron2.layers import NaiveSyncBatchNorm, FrozenBatchNorm2d
+from detectron2.layers import FrozenBatchNorm2d
 from detectron2.modeling import Backbone, BACKBONE_REGISTRY
 
 
@@ -88,14 +89,14 @@ class Conv2d_BN(nn.Sequential):
         self.groups = groups
 
         conv = nn.Conv2d(in_channels, out_channels, kernel_size,
-                         stride, padding, dilation, groups)
+                         stride, padding, dilation, groups, bias=False)
         c2_xavier_fill(conv)
         self.add_module('c', conv)
 
         if norm == "FrozenBN":
             bn = FrozenBatchNorm2d(out_channels)
         elif norm == "SyncBN":
-            bn = NaiveSyncBatchNorm(out_channels)
+            bn = nn.SyncBatchNorm(out_channels)
         else:
             bn = nn.BatchNorm2d(out_channels)
         nn.init.constant_(bn.weight, bn_weight_init)
@@ -322,9 +323,24 @@ class InjectionMultiSum(nn.Module):
         norm='BN'
     ) -> None:
         super(InjectionMultiSum, self).__init__()
-        self.local_embedding = Conv2d_BN(inp, oup, kernel_size=1, norm=norm)
-        self.global_embedding = Conv2d_BN(inp, oup, kernel_size=1, norm=norm)
-        self.global_act = Conv2d_BN(inp, oup, kernel_size=1, norm=norm)
+        if norm == "FrozenBN":
+            BN = FrozenBatchNorm2d
+        elif norm == "SyncBN":
+            BN = nn.SyncBatchNorm
+        else:
+            BN = nn.BatchNorm2d
+        self.local_embedding = nn.Sequential(OrderedDict([
+            ('conv', nn.Conv2d(inp, oup, 1, bias=False)),
+            ('bn', BN(oup))
+        ]))
+        self.global_embedding = nn.Sequential(OrderedDict([
+            ('conv', nn.Conv2d(inp, oup, 1, bias=False)),
+            ('bn', BN(oup))
+        ]))
+        self.global_act = nn.Sequential(OrderedDict([
+            ('conv', nn.Conv2d(inp, oup, 1, bias=False)),
+            ('bn', BN(oup))
+        ]))
         self.act = h_sigmoid()
 
     def forward(self, x_l, x_g):
@@ -358,9 +374,26 @@ class InjectionMultiSumCBR(nn.Module):
         global_act: conv
         '''
         super(InjectionMultiSumCBR, self).__init__()
-        self.local_embedding = Conv2d_BN(inp, oup, kernel_size=1, norm=norm)
-        self.global_embedding = Conv2d_BN(inp, oup, kernel_size=1, norm=norm)
-        self.global_act = Conv2d_BN(inp, oup, kernel_size=1, norm=norm)
+        if norm == "FrozenBN":
+            BN = FrozenBatchNorm2d
+        elif norm == "SyncBN":
+            BN = nn.SyncBatchNorm
+        else:
+            BN = nn.BatchNorm2d
+        self.local_embedding = nn.Sequential(OrderedDict([
+            ('conv', nn.Conv2d(inp, oup, 1, bias=False)),
+            ('bn', BN(oup)),
+            ('act', nn.ReLU(inplace=True))
+        ]))
+        self.global_embedding = nn.Sequential(OrderedDict([
+            ('conv', nn.Conv2d(inp, oup, 1, bias=False)),
+            ('bn', BN(oup)),
+            ('act', nn.ReLU(inplace=True))
+        ]))
+        self.global_act = nn.Sequential(OrderedDict([
+            ('conv', nn.Conv2d(inp, oup, 1, bias=False)),
+            ('bn', BN(oup)),
+        ]))
         self.act = h_sigmoid()
 
         self.out_channels = oup
@@ -466,7 +499,7 @@ class Topformer(Backbone):
             for i in range(len(self.channels)):
                 if i in self.decode_out_indices:
                     self.SIM.append(
-                        inj_module(self.channels[i], self.out_channels[i], norm=norm, activations=act_layer))
+                        inj_module(self.channels[i], self.out_channels[i], norm=norm))
                 else:
                     self.SIM.append(nn.Identity())
 
